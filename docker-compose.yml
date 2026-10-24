@@ -1,0 +1,254 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: detai14-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: project_management
+      POSTGRES_USER: project_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set strong passwords}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U project_app -d project_management"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    build: ./app
+    container_name: detai14-app
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: project_management
+      DB_USER: project_app
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set strong passwords}
+      NODE_ENV: production
+    expose:
+      - "3000"
+    volumes:
+      - app_logs:/var/log/project-management
+    networks:
+      - proxy
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+
+  log-volume-init:
+    image: alpine:3.21
+    container_name: detai14-log-volume-init
+    restart: "no"
+    command: ["sh", "-c", "chown 101:101 /logs && chmod 0750 /logs"]
+    volumes:
+      - nginx_access_logs:/logs
+
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    container_name: detai14-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx_access_logs:/var/log/nginx-logs
+    networks:
+      - proxy
+    depends_on:
+      app:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      grafana:
+        condition: service_started
+      promtail:
+        condition: service_started
+      log-volume-init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+
+  pgadmin:
+    image: dpage/pgadmin4:8.14
+    container_name: detai14-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?Set PGADMIN_EMAIL in .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:?Set PGADMIN_PASSWORD in .env}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+    volumes:
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    ports:
+      - "127.0.0.1:5050:80"
+    networks:
+      - proxy
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: detai14-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.external-url=/prometheus/"
+      - "--web.route-prefix=/"
+    expose:
+      - "9090"
+    networks:
+      - proxy
+      - observability
+    depends_on:
+      - postgres-exporter
+      - cadvisor
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: detai14-postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: db:5432/project_management?sslmode=disable
+      DATA_SOURCE_USER: project_app
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set strong passwords}
+    expose:
+      - "9187"
+    networks:
+      - backend
+      - observability
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: detai14-cadvisor
+    restart: unless-stopped
+    command:
+      - "--docker_only=true"
+      - "--housekeeping_interval=30s"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    expose:
+      - "8080"
+    networks:
+      - observability
+    security_opt:
+      - no-new-privileges:true
+
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: detai14-loki
+    restart: unless-stopped
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    expose:
+      - "3100"
+    networks:
+      - observability
+    security_opt:
+      - no-new-privileges:true
+
+  promtail:
+    image: grafana/promtail:3.5.0
+    container_name: detai14-promtail
+    restart: unless-stopped
+    command:
+      - "-config.file=/etc/promtail/config.yaml"
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - app_logs:/var/log/project-management:ro
+      - nginx_access_logs:/var/log/nginx-logs:ro
+      - promtail_positions:/tmp
+    networks:
+      - observability
+    depends_on:
+      loki:
+        condition: service_started
+      log-volume-init:
+        condition: service_completed_successfully
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: detai14-grafana
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: "http://localhost:8080/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    expose:
+      - "3000"
+    networks:
+      - proxy
+      - observability
+    depends_on:
+      - prometheus
+      - loki
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  proxy:
+  backend:
+    internal: true
+  observability:
+    internal: true
+
+volumes:
+  postgres_data:
+  app_logs:
+  nginx_access_logs:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  promtail_positions:
